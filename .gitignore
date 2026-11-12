@@ -1,0 +1,7 @@
+**/bin/
+**/obj/
+artifacts/
+.syncapp/
+.vscode/
+*.user
+*.suo
