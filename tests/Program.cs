@@ -16,7 +16,8 @@ var tests = new (string Name, Func<Task> Run)[]
     ("prepared packages cannot follow rewritten source history", PreparedChainRejectsSourceRewrite),
     ("work rejects a changed pinned descriptor after pull", ChangedDescriptorIsRejected),
     ("work rejects duplicate JSON descriptor fields", DuplicateDescriptorFieldIsRejected),
-    ("work accepts canonical descriptor under autocrlf", WorkSupportsAutocrlfDescriptor),
+    ("work accepts canonical LF descriptor", () => WorkSupportsDescriptorLineEndings(autocrlf: false)),
+    ("work accepts canonical descriptor under autocrlf", () => WorkSupportsDescriptorLineEndings(autocrlf: true)),
     ("empty foreign junk commit is never published", EmptyForeignJunkCommitCannotBePushed),
     ("owned .age symlink is rejected before staging", AgeSymlinkIsRejected),
     ("staged unrelated junk changes remain untouched and block sync", StagedUnrelatedJunkBlocksSync),
@@ -388,7 +389,7 @@ static async Task DuplicateDescriptorFieldIsRejected()
     await ThrowsData(() => workEngine.SyncJunk(work.Id, "test passphrase", push: false), "duplicate known JSON descriptor property");
 }
 
-static async Task WorkSupportsAutocrlfDescriptor()
+static async Task WorkSupportsDescriptorLineEndings(bool autocrlf)
 {
     using var workspace = new TestWorkspace();
     var (bare, personalJunk) = await workspace.NewBareAndClone("transport", "personal-junk");
@@ -396,10 +397,16 @@ static async Task WorkSupportsAutocrlfDescriptor()
     await File.WriteAllTextAsync(Path.Combine(workRepo, "base.txt"), "baseline\n");
     await Git(workRepo, "add", ".");
     await Git(workRepo, "commit", "-m", "baseline");
-    var (personal, work, _, _) = await ConnectedProjects(workspace, bare, personalJunk, workspace.PathFor("personal-source"), workRepo, workAutocrlf: true);
-    var descriptorBytes = await File.ReadAllBytesAsync(Path.Combine(work.JunkPath, work.Folder, "project.json"));
-    Check(Encoding.UTF8.GetString(descriptorBytes).Contains("\r\n", StringComparison.Ordinal), "fixture did not materialize descriptor with CRLF");
-    Check(work.BaselineVerified, "CRLF descriptor blocked work baseline verification");
+    var (_, work, _, _) = await ConnectedProjects(workspace, bare, personalJunk,
+        workspace.PathFor("personal-source"), workRepo, workAutocrlf: autocrlf);
+    var descriptor = await File.ReadAllTextAsync(Path.Combine(work.JunkPath, work.Folder, "project.json"));
+    var expectedLineEnding = autocrlf ? "\r\n" : "\n";
+    Check(descriptor.Contains(expectedLineEnding, StringComparison.Ordinal), "fixture did not materialize the expected descriptor line ending");
+    if (!autocrlf)
+    {
+        Check(!descriptor.Contains("\r\n", StringComparison.Ordinal), "LF fixture contains CRLF");
+    }
+    Check(work.BaselineVerified, "descriptor line ending blocked work baseline verification");
 }
 
 static async Task EmptyForeignJunkCommitCannotBePushed()
@@ -665,7 +672,8 @@ static async Task WorkSubdirectoryIsRejected()
 }
 
 static async Task<(LocalProject Personal, LocalProject Work, Registry PersonalRegistry, Registry WorkRegistry)> ConnectedProjects(
-    TestWorkspace workspace, string bare, string personalJunk, string personalRepo, string workRepo, bool workAutocrlf = false)
+    TestWorkspace workspace, string bare, string personalJunk, string personalRepo, string workRepo,
+    bool? workAutocrlf = null)
 {
     var oldDataDir = Environment.GetEnvironmentVariable("SYNCAPP_DATA_DIR");
     try
@@ -696,9 +704,9 @@ static async Task<(LocalProject Personal, LocalProject Work, Registry PersonalRe
         var personal = await personalEngine.CreatePersonal("project-one", personalJunk, personalRepo, "test passphrase");
         await personalEngine.SyncJunk(personal.Id, "test passphrase", push: true);
         var workJunk = await workspace.Clone(bare, "work-junk");
-        if (workAutocrlf)
+        if (workAutocrlf.HasValue)
         {
-            await Git(workJunk, "config", "core.autocrlf", "true");
+            await Git(workJunk, "config", "core.autocrlf", workAutocrlf.Value ? "true" : "false");
             await Git(workJunk, "checkout-index", "--force", "--", "project-one/project.json");
         }
         Environment.SetEnvironmentVariable("SYNCAPP_DATA_DIR", workspace.PathFor("work-data"));

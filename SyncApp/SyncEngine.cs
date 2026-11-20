@@ -9,6 +9,11 @@ namespace SyncApp;
 public sealed class SyncEngine(Registry registry, GitService git, CryptoService crypto,
     Func<OperationStage, Task>? checkpoint = null)
 {
+    private static readonly JsonSerializerOptions DescriptorJsonOptions = new(JsonConfig.Options)
+    {
+        NewLine = "\n"
+    };
+
     // Keep encrypted objects below GitHub's per-file 100 MiB limit with room for
     // the signed age envelope and JSON/base64 expansion.
     public const int EncryptedFileLimit = 64 * 1024 * 1024;
@@ -107,7 +112,7 @@ public sealed class SyncEngine(Registry registry, GitService git, CryptoService 
         var descriptor = JsonSerializer.Deserialize<ProjectDescriptor>(bytes, JsonConfig.Options)
             ?? throw new InvalidDataException("Дескриптор проекта пуст");
         var normalizedBytes = Encoding.UTF8.GetBytes(Encoding.UTF8.GetString(bytes).Replace("\r\n", "\n", StringComparison.Ordinal));
-        if (!normalizedBytes.AsSpan().SequenceEqual(JsonSerializer.SerializeToUtf8Bytes(descriptor, JsonConfig.Options)))
+        if (!normalizedBytes.AsSpan().SequenceEqual(JsonSerializer.SerializeToUtf8Bytes(descriptor, DescriptorJsonOptions)))
             throw new InvalidDataException("Дескриптор должен иметь точную каноническую схему SyncApp");
         return descriptor;
     }
@@ -143,7 +148,7 @@ public sealed class SyncEngine(Registry registry, GitService git, CryptoService 
             p.KeysFile = Path.Combine(registry.Root, "keys", p.Id + ".key");
             CryptoService.SaveKeys(p.KeysFile, keys, passphrase);
             Directory.CreateDirectory(ChannelDir(p));
-            await File.WriteAllTextAsync(DescriptorFile(p), JsonSerializer.Serialize(descriptor, JsonConfig.Options));
+            await File.WriteAllTextAsync(DescriptorFile(p), JsonSerializer.Serialize(descriptor, DescriptorJsonOptions));
             await registry.Save(p);
             return p;
         }
@@ -239,7 +244,7 @@ public sealed class SyncEngine(Registry registry, GitService git, CryptoService 
             var temp = descriptorPath + ".tmp-" + Guid.NewGuid().ToString("N");
             try
             {
-                await File.WriteAllTextAsync(temp, JsonSerializer.Serialize(descriptor, JsonConfig.Options));
+                await File.WriteAllTextAsync(temp, JsonSerializer.Serialize(descriptor, DescriptorJsonOptions));
                 File.Move(temp, descriptorPath, true);
             }
             finally { if (File.Exists(temp)) File.Delete(temp); }
