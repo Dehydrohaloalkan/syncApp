@@ -1,7 +1,9 @@
-using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Globalization;
+using Age;
+using Age.Recipients;
 
 namespace SyncApp;
 
@@ -15,46 +17,26 @@ public sealed class SecretKeys
 
 public sealed class CryptoService
 {
-    private static string AgeBinary => Environment.GetEnvironmentVariable("AGE_PATH") is { Length: > 0 } path ? path : "age";
-    private static string KeygenBinary => Environment.GetEnvironmentVariable("AGE_PATH") is { Length: > 0 } path ? Path.Combine(Path.GetDirectoryName(path)!, OperatingSystem.IsWindows() ? "age-keygen.exe" : "age-keygen") : "age-keygen";
-
-    private static async Task<byte[]> Execute(string binary, byte[]? input, params string[] args)
+    public Task<SecretKeys> Generate(string? workspaceRoot = null)
     {
-        var start = new ProcessStartInfo(binary) { RedirectStandardOutput = true, RedirectStandardError = true, RedirectStandardInput = true, UseShellExecute = false };
-        foreach (var arg in args) start.ArgumentList.Add(arg);
-        using var process = Process.Start(start) ?? throw new InvalidOperationException($"Не удалось запустить {binary}");
-        using var output = new MemoryStream();
-        var stdout = process.StandardOutput.BaseStream.CopyToAsync(output);
-        var stderr = process.StandardError.ReadToEndAsync();
-        if (input != null) { await process.StandardInput.BaseStream.WriteAsync(input); await process.StandardInput.BaseStream.FlushAsync(); }
-        process.StandardInput.Close();
-        await Task.WhenAll(stdout, stderr);
-        await process.WaitForExitAsync();
-        if (process.ExitCode != 0) throw new InvalidOperationException($"{Path.GetFileName(binary)}: {await stderr}");
-        return output.ToArray();
-    }
-
-    public async Task<SecretKeys> Generate(string? workspaceRoot = null)
-    {
-        var (identity, recipient) = await GenerateAgeIdentity(workspaceRoot);
+        var (identity, recipient) = GenerateAgeIdentity();
         using var rsa = RSA.Create(3072);
-        return new SecretKeys { AgeIdentity = identity, AgeRecipient = recipient, SigningPrivatePem = rsa.ExportRSAPrivateKeyPem(), SigningPublicPem = rsa.ExportSubjectPublicKeyInfoPem() };
+        var keys = new SecretKeys { AgeIdentity = identity, AgeRecipient = recipient, SigningPrivatePem = rsa.ExportRSAPrivateKeyPem(), SigningPublicPem = rsa.ExportSubjectPublicKeyInfoPem() };
+        return Task.FromResult(keys);
     }
 
-    public async Task<SecretKeys> GenerateAgeOnly(string? workspaceRoot = null)
+    public Task<SecretKeys> GenerateAgeOnly(string? workspaceRoot = null)
     {
-        var (identity, recipient) = await GenerateAgeIdentity(workspaceRoot);
-        return new SecretKeys { AgeIdentity = identity, AgeRecipient = recipient };
+        var (identity, recipient) = GenerateAgeIdentity();
+        return Task.FromResult(new SecretKeys { AgeIdentity = identity, AgeRecipient = recipient });
     }
 
-    private static async Task<(string Identity, string Recipient)> GenerateAgeIdentity(string? workspaceRoot)
+    private static (string Identity, string Recipient) GenerateAgeIdentity()
     {
-        using var workspace = PrivateWorkspace.Create(workspaceRoot);
-        var temp = workspace.FilePath("identity.txt");
-        await Execute(KeygenBinary, null, "-o", temp);
-        var identity = await File.ReadAllTextAsync(temp);
-        var recipient = identity.Split('\n').FirstOrDefault(x => x.StartsWith("# public key: "))?[14..].Trim()
-            ?? throw new InvalidDataException("age-keygen не вернул публичный ключ");
+        using var ageIdentity = AgeKeygen.Generate();
+        var recipient = ageIdentity.Recipient.ToString();
+        var createdAt = DateTimeOffset.Now.ToString("yyyy-MM-dd'T'HH:mm:sszzz", CultureInfo.InvariantCulture);
+        var identity = $"# created: {createdAt}\n# public key: {recipient}\n{ageIdentity.ToSecretString()}\n";
         return (identity, recipient);
     }
 
@@ -95,26 +77,114 @@ public sealed class CryptoService
         finally { CryptographicOperations.ZeroMemory(key); CryptographicOperations.ZeroMemory(plaintext); }
     }
 
-    public async Task<byte[]> Protect(byte[] payload, string recipient, SecretKeys signer)
+    public Task<byte[]> Protect(byte[] payload, string recipient, SecretKeys signer)
     {
         using var rsa = RSA.Create(); rsa.ImportFromPem(signer.SigningPrivatePem);
         var signature = rsa.SignData(payload, HashAlgorithmName.SHA256, RSASignaturePadding.Pss);
         var envelope = JsonSerializer.SerializeToUtf8Bytes(new SignedEnvelope { PayloadBase64 = Convert.ToBase64String(payload), SignatureBase64 = Convert.ToBase64String(signature), SigningKey = signer.SigningPublicPem }, JsonConfig.Options);
-        return await Execute(AgeBinary, envelope, "-r", recipient);
+        try
+        {
+            var ageRecipient = ParseAgeRecipient(recipient);
+            using var input = new MemoryStream(envelope, writable: false);
+            using var encrypted = new MemoryStream();
+            AgeEncrypt.Encrypt(input, encrypted, ageRecipient);
+            return Task.FromResult(encrypted.ToArray());
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(envelope);
+        }
     }
 
-    public async Task<byte[]> Open(byte[] ciphertext, SecretKeys recipient, string? pinnedSigner, string? expectedFingerprint = null, string? workspaceRoot = null)
+    public Task<byte[]> Open(byte[] ciphertext, SecretKeys recipient, string? pinnedSigner, string? expectedFingerprint = null, string? workspaceRoot = null)
     {
-        using var workspace = PrivateWorkspace.Create(workspaceRoot);
-        var temp = await workspace.WritePrivateFile("identity.txt", Encoding.UTF8.GetBytes(recipient.AgeIdentity));
-        var plain = await Execute(AgeBinary, ciphertext, "-d", "-i", temp);
-        var env = JsonSerializer.Deserialize<SignedEnvelope>(plain, JsonConfig.Options) ?? throw new InvalidDataException("Некорректный контейнер");
-        if (env.Version != 1) throw new NotSupportedException("Версия контейнера не поддерживается");
-        if (pinnedSigner != null && !CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(env.SigningKey), Encoding.UTF8.GetBytes(pinnedSigner))) throw new CryptographicException("Подпись другого устройства");
-        if (pinnedSigner == null && (expectedFingerprint == null || !string.Equals(expectedFingerprint, Fingerprint(env.SigningKey), StringComparison.OrdinalIgnoreCase))) throw new CryptographicException("Отпечаток отправителя не подтверждён");
-        var payload = Convert.FromBase64String(env.PayloadBase64);
-        using var rsa = RSA.Create(); rsa.ImportFromPem(env.SigningKey);
-        if (!rsa.VerifyData(payload, Convert.FromBase64String(env.SignatureBase64), HashAlgorithmName.SHA256, RSASignaturePadding.Pss)) throw new CryptographicException("Подпись пакета неверна");
-        return payload;
+        using var ageIdentity = ParseAgeIdentity(recipient.AgeIdentity);
+        using var input = new MemoryStream(ciphertext, writable: false);
+        using var decrypted = new MemoryStream(ciphertext.Length);
+        try
+        {
+            try
+            {
+                AgeEncrypt.Decrypt(input, decrypted, ageIdentity);
+            }
+            catch (AgeException exception)
+            {
+                throw new CryptographicException("Не удалось расшифровать age-пакет", exception);
+            }
+
+            var plain = decrypted.ToArray();
+            try
+            {
+                var env = JsonSerializer.Deserialize<SignedEnvelope>(plain, JsonConfig.Options)
+                    ?? throw new InvalidDataException("Некорректный контейнер");
+                if (env.Version != 1)
+                    throw new NotSupportedException("Версия контейнера не поддерживается");
+
+                if (pinnedSigner != null && !CryptographicOperations.FixedTimeEquals(
+                    Encoding.UTF8.GetBytes(env.SigningKey), Encoding.UTF8.GetBytes(pinnedSigner)))
+                    throw new CryptographicException("Подпись другого устройства");
+
+                if (pinnedSigner == null && (expectedFingerprint == null || !string.Equals(
+                    expectedFingerprint, Fingerprint(env.SigningKey), StringComparison.OrdinalIgnoreCase)))
+                    throw new CryptographicException("Отпечаток отправителя не подтверждён");
+
+                var payload = Convert.FromBase64String(env.PayloadBase64);
+                using var rsa = RSA.Create();
+                rsa.ImportFromPem(env.SigningKey);
+                var signature = Convert.FromBase64String(env.SignatureBase64);
+                if (!rsa.VerifyData(payload, signature, HashAlgorithmName.SHA256, RSASignaturePadding.Pss))
+                    throw new CryptographicException("Подпись пакета неверна");
+
+                CryptographicOperations.ZeroMemory(signature);
+                return Task.FromResult(payload);
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(plain);
+            }
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(decrypted.GetBuffer().AsSpan(0, (int)decrypted.Length));
+        }
+    }
+
+    private static X25519Recipient ParseAgeRecipient(string recipient)
+    {
+        try
+        {
+            return AgeKeygen.ParseRecipient(recipient);
+        }
+        catch (FormatException exception)
+        {
+            throw new InvalidDataException("Некорректный публичный age-ключ", exception);
+        }
+    }
+
+    private static X25519Identity ParseAgeIdentity(string identityText)
+    {
+        var identityLines = new List<string>();
+        foreach (var line in identityText.Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (line.StartsWith('#'))
+                continue;
+
+            if (!line.StartsWith("AGE-SECRET-KEY-1", StringComparison.Ordinal))
+                throw new InvalidDataException("Файл age-ключа повреждён");
+
+            identityLines.Add(line);
+        }
+
+        if (identityLines.Count != 1)
+            throw new InvalidDataException("Файл age-ключа повреждён");
+
+        try
+        {
+            return AgeKeygen.ParseIdentity(identityLines[0]);
+        }
+        catch (FormatException exception)
+        {
+            throw new InvalidDataException("Файл age-ключа повреждён", exception);
+        }
     }
 }

@@ -1,0 +1,4 @@
+identity.txt text eol=lf
+signing-public.pem text eol=lf
+envelope.age -text
+payload.bin -text

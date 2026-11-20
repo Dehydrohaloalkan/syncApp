@@ -39,6 +39,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("rebase directories and sequencer block application", RebaseAndSequencerAreBlocked),
     ("case-insensitive path collisions are rejected on WSL", CaseCollisionIsBlocked),
     ("unsafe archive paths are rejected", UnsafePathsAreRejected),
+    ("legacy commented age identity opens reference CLI age-v1 ciphertext", LegacyAgeCliIdentityAndCiphertext),
     ("large encrypted package roundtrips and rejects wrong signer", CryptoRoundtripAndSigner)
 };
 
@@ -985,20 +986,77 @@ static async Task CryptoRoundtripAndSigner()
 {
     using var workspace = new TestWorkspace();
     var stateRoot = workspace.PathFor("state");
-    var age = Environment.GetEnvironmentVariable("AGE_PATH");
-    if (string.IsNullOrEmpty(age) || !File.Exists(age)) throw new Exception("Set AGE_PATH to a verified age binary before running tests");
     var service = new CryptoService();
-    var sender = await service.Generate(stateRoot);
-    var receiver = await service.Generate(stateRoot);
-    var other = await service.Generate(stateRoot);
-    var payload = RandomNumberGenerator.GetBytes(1024 * 1024);
-    var encrypted = await service.Protect(payload, receiver.AgeRecipient, sender).WaitAsync(TimeSpan.FromSeconds(30));
-    Check(encrypted.AsSpan().IndexOf(payload.AsSpan(0, 128)) < 0, "ciphertext contains plaintext prefix");
-    var opened = await service.Open(encrypted, receiver, sender.SigningPublicPem, workspaceRoot: stateRoot).WaitAsync(TimeSpan.FromSeconds(30));
-    Check(payload.AsSpan().SequenceEqual(opened), "large package changed during encryption");
-    await ThrowsCrypto(() => service.Open(encrypted, receiver, other.SigningPublicPem, workspaceRoot: stateRoot), "untrusted signer");
-    encrypted[^10] ^= 1;
-    await ThrowsCrypto(() => service.Open(encrypted, receiver, sender.SigningPublicPem, workspaceRoot: stateRoot), "tampered ciphertext");
+    var previousAgePath = Environment.GetEnvironmentVariable("AGE_PATH");
+    Environment.SetEnvironmentVariable("AGE_PATH", Path.Combine(stateRoot, "missing-age-tool"));
+    try
+    {
+        var sender = await service.Generate(stateRoot);
+        var receiver = await service.Generate(stateRoot);
+        var other = await service.Generate(stateRoot);
+        Check(sender.AgeIdentity.Contains("# created: ", StringComparison.Ordinal), "built-in identity is missing the CLI creation comment");
+        Check(sender.AgeIdentity.Contains($"# public key: {sender.AgeRecipient}", StringComparison.Ordinal), "built-in identity is missing the recipient comment");
+        var payload = RandomNumberGenerator.GetBytes(1024 * 1024);
+        var encrypted = await service.Protect(payload, receiver.AgeRecipient, sender).WaitAsync(TimeSpan.FromSeconds(30));
+        Check(encrypted.AsSpan().IndexOf(payload.AsSpan(0, 128)) < 0, "ciphertext contains plaintext prefix");
+        var opened = await service.Open(encrypted, receiver, sender.SigningPublicPem, workspaceRoot: stateRoot).WaitAsync(TimeSpan.FromSeconds(30));
+        Check(payload.AsSpan().SequenceEqual(opened), "large package changed during encryption");
+        await ThrowsCrypto(() => service.Open(encrypted, receiver, other.SigningPublicPem, workspaceRoot: stateRoot), "untrusted signer");
+
+        var tamperedCiphertext = encrypted.ToArray();
+        tamperedCiphertext[^10] ^= 1;
+        await ThrowsCrypto(() => service.Open(tamperedCiphertext, receiver, sender.SigningPublicPem, workspaceRoot: stateRoot), "tampered ciphertext");
+    }
+    finally
+    {
+        Environment.SetEnvironmentVariable("AGE_PATH", previousAgePath);
+    }
+}
+
+static async Task LegacyAgeCliIdentityAndCiphertext()
+{
+    using var workspace = new TestWorkspace();
+    var fixtureDirectory = Path.Combine(AppContext.BaseDirectory, "fixtures", "age-v1");
+    var identityText = await File.ReadAllTextAsync(Path.Combine(fixtureDirectory, "identity.txt"));
+    var recipientLine = identityText.Split('\n').Single(line => line.StartsWith("# public key: ", StringComparison.Ordinal));
+    var recipient = recipientLine["# public key: ".Length..].Trim();
+    var signingPublicKey = (await File.ReadAllTextAsync(Path.Combine(fixtureDirectory, "signing-public.pem")))
+        .Replace("\r\n", "\n", StringComparison.Ordinal);
+    var ciphertext = await File.ReadAllBytesAsync(Path.Combine(fixtureDirectory, "envelope.age"));
+    var expectedPayload = await File.ReadAllBytesAsync(Path.Combine(fixtureDirectory, "payload.bin"));
+    var legacyKeys = new SecretKeys
+    {
+        AgeIdentity = identityText,
+        AgeRecipient = recipient,
+        SigningPublicPem = signingPublicKey
+    };
+
+    var keyPath = Path.Combine(workspace.PathFor("state"), "legacy.key");
+    CryptoService.SaveKeys(keyPath, legacyKeys, "legacy test passphrase");
+    var loadedKeys = CryptoService.LoadKeys(keyPath, "legacy test passphrase");
+    Equal(identityText, loadedKeys.AgeIdentity, "commented age identity changed when loading legacy key file");
+    Equal(recipient, loadedKeys.AgeRecipient, "legacy age recipient changed when loading key file");
+
+    var service = new CryptoService();
+    var opened = await service.Open(ciphertext, loadedKeys, signingPublicKey);
+    Check(expectedPayload.AsSpan().SequenceEqual(opened), "reference age-v1 CLI ciphertext payload changed");
+
+    var crlfKeys = new SecretKeys
+    {
+        AgeIdentity = identityText.Replace("\r\n", "\n", StringComparison.Ordinal).Replace("\n", "\r\n", StringComparison.Ordinal),
+        AgeRecipient = recipient,
+        SigningPublicPem = signingPublicKey
+    };
+    var openedFromCrLfIdentity = await service.Open(ciphertext, crlfKeys, signingPublicKey);
+    Check(expectedPayload.AsSpan().SequenceEqual(openedFromCrLfIdentity), "commented CRLF age identity could not decrypt reference ciphertext");
+
+    var tamperedCiphertext = ciphertext.ToArray();
+    tamperedCiphertext[tamperedCiphertext.Length / 2] ^= 1;
+    await ThrowsCrypto(() => service.Open(tamperedCiphertext, loadedKeys, signingPublicKey), "tampered reference age-v1 ciphertext");
+    await ThrowsCrypto(() => service.Open(ciphertext[..^16], loadedKeys, signingPublicKey), "truncated reference age-v1 ciphertext");
+
+    var wrongRecipient = await service.GenerateAgeOnly(workspace.PathFor("other-state"));
+    await ThrowsCrypto(() => service.Open(ciphertext, wrongRecipient, signingPublicKey), "wrong legacy age recipient");
 }
 
 static async Task ThrowsCrypto(Func<Task> operation, string context)

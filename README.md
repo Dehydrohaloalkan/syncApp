@@ -15,8 +15,9 @@ Git-коммиты. SyncApp подписывает и шифрует измен�
 
 ## Запуск
 
-Нужны .NET SDK 10, Git, `age` и `age-keygen`. Если age отсутствует в PATH,
-задайте `AGE_PATH`; age-keygen должен лежать рядом. На обеих машинах заранее
+Для запуска из исходников нужны Git и .NET SDK 10. Ключи X25519, шифрование
+и расшифровку выполняет сам SyncApp. Для сборки из чистого клона пакеты NuGet
+включены в каталог `third_party/packages`. На обеих машинах заранее
 клонируйте отдельную transport-репу junk и настройте upstream ветки.
 Личной стороне нужен доступ на публикацию, рабочей достаточно чтения.
 Git identity исходных реп настраивается обычными средствами Git.
@@ -25,7 +26,7 @@ Git identity исходных реп настраивается обычными
 
 ```bash
 dotnet build SyncApp.slnx
-AGE_PATH=/opt/age/age dotnet run --project SyncApp/SyncApp.csproj --no-build
+dotnet run --project SyncApp/SyncApp.csproj --no-build
 ```
 
 На личной машине host запускается в WSL рядом с Git и проектами, интерфейс
@@ -33,7 +34,6 @@ AGE_PATH=/opt/age/age dotnet run --project SyncApp/SyncApp.csproj --no-build
 своей конфигурации WSL. На рабочей Windows:
 
 ```powershell
-$env:AGE_PATH = 'C:\Tools\age\age.exe'
 dotnet run --project SyncApp/SyncApp.csproj
 ```
 
@@ -41,7 +41,6 @@ dotnet run --project SyncApp/SyncApp.csproj
 
 | Переменная | Назначение |
 | --- | --- |
-| `AGE_PATH` | Путь к age; age-keygen ищется рядом |
 | `SYNCAPP_PORT` | Loopback-порт, по умолчанию 5055 |
 | `SYNCAPP_DATA_DIR` | Каталог локального состояния; по умолчанию SyncApp в LocalApplicationData |
 
@@ -77,7 +76,8 @@ dotnet run --project SyncApp/SyncApp.csproj
 
 Личный отпечаток связывает ключ подписи и публичный age-ключ личного устройства;
 рабочий отпечаток относится к age recipient. Секретные ключи защищены локальным
-паролем. Версия протокола подключения — 3.
+паролем. Версия протокола подключения — 3. После обновления продолжают работать
+существующие ключи, каналы и пакеты, созданные прежней версией через age.
 
 ## Передача изменений
 
@@ -141,21 +141,22 @@ dotnet run --project SyncApp/SyncApp.csproj
 
 ## Самодостаточные сборки
 
+На машине сборки SDK при необходимости скачает среду выполнения целевой платформы.
+
 ```bash
-dotnet publish SyncApp/SyncApp.csproj -c Release -r win-x64 --self-contained true -o artifacts/win-x64
-dotnet publish SyncApp/SyncApp.csproj -c Release -r linux-x64 --self-contained true -o artifacts/linux-x64
+dotnet publish SyncApp/SyncApp.csproj -c Release -r win-x64 --self-contained true --source ./third_party/packages --source https://api.nuget.org/v3/index.json -o artifacts/win-x64
+dotnet publish SyncApp/SyncApp.csproj -c Release -r linux-x64 --self-contained true --source ./third_party/packages --source https://api.nuget.org/v3/index.json -o artifacts/linux-x64
 ```
 
 Переносится весь каталог с wwwroot. Запуск: `SyncApp.exe` на Windows или
-`./SyncApp` в Linux/WSL. SDK и отдельный runtime не нужны; Git, age и age-keygen
-остаются внешними зависимостями. Артефакты прежнего прототипа требуют пересборки.
+`./SyncApp` в Linux/WSL. Для готовой сборки на целевой машине достаточно установленного Git. Артефакты прежнего прототипа требуют пересборки.
 Сборка win-x64 сама по себе не подтверждает запуск на Windows 10.
 
 ## Проверки и разработка
 
 ```bash
 dotnet build SyncApp.slnx
-AGE_PATH=/absolute/path/to/age dotnet run --project tests/SyncApp.Tests.csproj --no-build
+dotnet run --project tests/SyncApp.Tests.csproj --no-build
 python3 tests/http_security.py
 ```
 
